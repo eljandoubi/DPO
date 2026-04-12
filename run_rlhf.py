@@ -10,11 +10,10 @@ import stable_baselines3 as sb3
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from tqdm import trange
 
 from data import load_data
-from util import export_plot, np2torch
+from util import export_plot
 
 
 class RewardModel(nn.Module):
@@ -36,7 +35,6 @@ class RewardModel(nn.Module):
         r_max : float
             Maximum reward value
 
-        TODO:
         Define self.net to be a neural network with a single hidden layer of size
         hidden_dim that takes as input an observation and an action and outputs a
         reward value. Use LeakyRelu as hidden activation function, and set the
@@ -50,7 +48,11 @@ class RewardModel(nn.Module):
         super().__init__()
         #######################################################
         #########   YOUR CODE HERE - 2-10 lines.   ############
-
+        self.net = nn.Sequential(nn.Linear(obs_dim+action_dim,hidden_dim),
+                                 nn.LeakyReLU(),
+                                 nn.Linear(hidden_dim,1),
+                                 nn.Sigmoid())
+        self.optimizer = torch.optim.AdamW(self.parameters())
         #######################################################
         #########          END YOUR CODE.          ############
         self.r_min = r_min
@@ -71,7 +73,6 @@ class RewardModel(nn.Module):
         torch.Tensor
             Batch of predicted rewards
 
-        TODO:
         Use self.net to predict the rewards associated with the input
         (observation, action) pairs, and scale them so that they are
         within [self.r_min, self.r_max].
@@ -86,10 +87,10 @@ class RewardModel(nn.Module):
         else:
             needs_reshape = False
 
-        rewards = torch.zeros(obs.shape[0])
         #######################################################
         #########   YOUR CODE HERE - 2-3 lines.   ############
-
+        inputs = torch.cat((obs,action),dim=1)
+        rewards = (self.r_max - self.r_min) * self.net(inputs) + self.r_min
         #######################################################
         #########          END YOUR CODE.          ############
 
@@ -112,7 +113,6 @@ class RewardModel(nn.Module):
         float
             The predicted reward for the state-action pair.
 
-        TODO:
         Return the predicted reward for the given (observation, action) pair. Pay
         attention to the argument and return types!
 
@@ -121,11 +121,18 @@ class RewardModel(nn.Module):
         """
         #######################################################
         #########   YOUR CODE HERE - 1-4 lines.   ############
-
+        if obs.ndim==1:
+            obs=obs.reshape(1, -1)
+        if action.ndim==1:
+            action=action.reshape(1, -1)
+        obs = torch.from_numpy(obs).float()
+        action = torch.from_numpy(action).float()
+        reward = self(obs, action)
         #######################################################
         #########          END YOUR CODE.          ############
+        return reward.item()
 
-    def update(self, batch: Tuple[torch.Tensor]):
+    def update(self, batch: Tuple[torch.Tensor,...]):
         """Given a batch of data, update the reward model.
 
         Parameters
@@ -135,7 +142,6 @@ class RewardModel(nn.Module):
             encoding preferences (0 if the first one is preferred, 1 if the second
             one is preferred, and 0.5 if they are equally preferred).
 
-        TODO:
         Compute the cumulative predicted rewards for each trajectory, and calculate
         your loss following the Bradley-Terry preference model.
 
@@ -144,10 +150,12 @@ class RewardModel(nn.Module):
         """
         obs1, obs2, act1, act2, label, _ = batch
 
-        loss = torch.zeros(1)
         #######################################################
         #########   YOUR CODE HERE - 5-10 lines.   ############
-
+        reward1 = self(obs1, act1)
+        reward2 = self(obs2, act2)
+        prob = F.sigmoid((reward1 - reward2).sum(1))
+        loss = F.cross_entropy(prob, label)
         #######################################################
         #########          END YOUR CODE.          ############
 
