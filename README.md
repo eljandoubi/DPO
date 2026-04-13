@@ -1,4 +1,4 @@
-# Starter code for HW3
+# Compare PPO, RLHF and DPO
 
 ## Environment set up
 
@@ -38,12 +38,3 @@ pip install -r requirements.txt
 Note: If `pip install` prints a warning about `jupyter-client` missing dependencies
 (`jupyter-core`, `tornado`, `traitlets`), this is non-blocking for this assignment
 as long as the install completes successfully.
-
-After this you are good to go!
-
-## Submission
-
-To generate your submission zip file, run:
-```
-bash collect_submission.sh
-```
