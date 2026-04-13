@@ -1,17 +1,17 @@
+import copy
 import pathlib
 from typing import Tuple
-import copy
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.distributions as D
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import trange
 
 from data import load_data
-from util import export_plot, np2torch, standard_error, eval_mode
-
+from util import eval_mode, export_plot, np2torch, standard_error
 
 LOGSTD_MIN = -10.0
 LOGSTD_MAX = 2.0
@@ -25,6 +25,7 @@ class ActionSequenceModel(nn.Module):
         hidden_dim: int,
         segment_len: int,
         lr: float = 1e-5,
+        device:str|None=None
     ):
         """Initialize an action sequence model.
 
@@ -41,7 +42,6 @@ class ActionSequenceModel(nn.Module):
         lr : float, optional
             Optimizer learning rate, by default 1e-3
 
-        TODO:
         Define self.net to be a neural network with a single hidden layer of size
         hidden_dim that takes as input an observation and outputs the parameters
         to define an action distribution for each time step of the sequence.
@@ -59,9 +59,21 @@ class ActionSequenceModel(nn.Module):
         self.segment_len = segment_len
         #######################################################
         #########   YOUR CODE HERE - 3-9 lines.    ############
-
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
+        self.device = device
+        self.net = nn.Sequential(nn.Linear(obs_dim,hidden_dim),
+                                 nn.ReLU(),
+                                 nn.Linear(hidden_dim, 2 * segment_len * action_dim))
+        self.to(device)
+        self.optimizer = torch.optim.AdamW(self.parameters(),lr=lr)
         #######################################################
         #########          END YOUR CODE.          ############
+        
+
 
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return the mean and standard deviation of the action distribution for each observation.
@@ -76,7 +88,6 @@ class ActionSequenceModel(nn.Module):
         Tuple[torch.Tensor]
             The means and standard deviations for the actions at future timesteps
 
-        TODO:
         Return mean and standard deviation vectors assuming that self.net predicts
         mean and log std.
 
@@ -96,11 +107,17 @@ class ActionSequenceModel(nn.Module):
             obs = np2torch(obs)
         assert obs.ndim == 2
         batch_size = len(obs)
+        obs = obs.to(device=self.device,dtype=torch.float)
         net_out = self.net(obs)
 
         #######################################################
         #########   YOUR CODE HERE - 3-9 lines.    ############
-
+        split_size = self.segment_len*self.action_dim
+        mean, std = torch.split(net_out,split_size,dim=1)
+        mean = mean.reshape(batch_size,self.segment_len,self.action_dim)
+        std = std.reshape(batch_size,self.segment_len,self.action_dim)
+        mean = mean.tanh()
+        std = std.clamp(LOGSTD_MIN,LOGSTD_MAX)
         #######################################################
         #########          END YOUR CODE.          ############
         return mean, std
@@ -118,7 +135,7 @@ class ActionSequenceModel(nn.Module):
         D.Distribution
             The action sequence distributions
 
-        TODO: Given an observation, use self.forward to compute the mean and
+        Given an observation, use self.forward to compute the mean and
         standard deviation of the action sequence distributions, and return the
         corresponding multivariate normal distribution.
 
@@ -129,9 +146,12 @@ class ActionSequenceModel(nn.Module):
         """
         #######################################################
         #########   YOUR CODE HERE - 1-5 lines.    ############
-
+        mean, std = self(obs)
+        normal = D.Normal(mean, std.exp())
+        return D.Independent(normal,1)
         #######################################################
         #########          END YOUR CODE.          ############
+        
 
     def act(self, obs: np.ndarray) -> np.ndarray:
         """Return an action given an observation
@@ -146,7 +166,6 @@ class ActionSequenceModel(nn.Module):
         np.ndarray
             The selected action
 
-        TODO:
         Predict the full action sequence, and return the first action.
         This function is for evaluation so we can simply **take the mean**
         instead of sampling from the actual Gaussian distribution to
@@ -159,9 +178,13 @@ class ActionSequenceModel(nn.Module):
         """
         #######################################################
         #########   YOUR CODE HERE - 2-6 lines.    ############
-
+        if obs.ndim==1:
+            obs = obs.reshape(1,-1)
+        mean,_= self(obs)
+        return mean[0,0].detach().cpu().numpy()
         #######################################################
         #########          END YOUR CODE.          ############
+        
 
 
 class SFT(ActionSequenceModel):
@@ -175,7 +198,6 @@ class SFT(ActionSequenceModel):
         actions : torch.Tensor
             A plan of actions for the next timesteps
 
-        TODO:
         Get the underlying action distribution, calculate the log probabilities
         of the given actions, and update the parameters in order to maximize their
         mean.
@@ -186,7 +208,13 @@ class SFT(ActionSequenceModel):
         """
         #######################################################
         #########   YOUR CODE HERE - 4-6 lines.    ############
-
+        actions = actions.to(self.device)
+        dist = self.distribution(obs)
+        loss = - dist.log_prob(actions).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.parameters(),1)
+        self.optimizer.step()
         #######################################################
         #########          END YOUR CODE.          ############
         return loss.item()
@@ -210,7 +238,7 @@ class DPO(ActionSequenceModel):
         obs: torch.Tensor,
         actions_w: torch.Tensor,
         actions_l: torch.Tensor,
-        ref_policy: nn.Module,
+        ref_policy: ActionSequenceModel,
     ):
         """Run one DPO update step
 
@@ -222,10 +250,9 @@ class DPO(ActionSequenceModel):
             The actions of the preferred trajectory
         actions_l : torch.Tensor
             The actions of the other trajectory
-        ref_policy : nn.Module
+        ref_policy : ActionSequenceModel
             The reference policy
 
-        TODO:
         Implement the DPO update step.
 
         Note: Clip the gradient norm to 1 for more stable training.
@@ -237,7 +264,20 @@ class DPO(ActionSequenceModel):
         """
         #######################################################
         #########   YOUR CODE HERE - 8-14 lines.   ############
+        actions_w = actions_w.to(self.device)
+        actions_l = actions_l.to(self.device)
+        with torch.no_grad():
+            dist_r = ref_policy.distribution(obs)
+            denominator = dist_r.log_prob(actions_w)-dist_r.log_prob(actions_l)
 
+        dist_p = self.distribution(obs)
+        nominator = dist_p.log_prob(actions_w)-dist_p.log_prob(actions_l)
+        
+        loss = - F.logsigmoid(self.beta*(nominator-denominator)).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.parameters(),1)
+        self.optimizer.step()
         #######################################################
         #########          END YOUR CODE.          ############
         return loss.item()

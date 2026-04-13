@@ -10,3 +10,4 @@ wheels/
 .venv
 results*/
 *.mp4
+tmp.py
